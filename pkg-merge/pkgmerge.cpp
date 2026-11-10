@@ -11,7 +11,7 @@
 #include <list>
 #include <assert.h>
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
 using std::string;
 using std::map;
 using std::vector;
@@ -135,7 +135,7 @@ int main(int argc, char *argv[])
 		}
 
 		//Wasn't found, so let's try to see if it's a root PKG file.
-		std::ifstream ifs(file, std::ios::binary);
+		std::ifstream ifs(file.path(), std::ios::binary);
 		char magic[4];
 		ifs.read(magic, sizeof(magic));
 		ifs.close();
