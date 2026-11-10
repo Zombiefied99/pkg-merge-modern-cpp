@@ -1,162 +1,412 @@
-// pkgmerge.cpp : Defines the entry point for the console application.
-//
+// pkgmerge.cpp
 
-#include "stdafx.h"
-#include <stdio.h>
-#include <string>
-#include <iostream>
-#include <fstream>
+// Remove this line unless your Visual Studio project uses precompiled headers.
+ #include "stdafx.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <map>
-#include <list>
-#include <assert.h>
+#include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
-using std::string;
+
 using std::map;
+using std::string;
 using std::vector;
 
-struct Package {
-	int					part;
-	fs::path			file;
-	vector<Package>		parts;
-	bool operator < (const Package& rhs) const {
-		return part < rhs.part;
-	}
+struct Package
+{
+    int part = 0;
+    fs::path file;
+    vector<Package> parts;
+
+    bool operator<(const Package& rhs) const
+    {
+        return part < rhs.part;
+    }
 };
 
-const char PKG_MAGIC[4] = { 0x7F, 0x43, 0x4E, 0x54 };
+constexpr std::array<unsigned char, 4> PKG_MAGIC = {
+    0x7F, 0x43, 0x4E, 0x54
+};
 
-
-void merge(map<string, Package> packages) {
-	for (auto & root : packages) {
-		auto pkg = root.second;
-
-		// Before we start, we need to sort the lists properly
-		std::sort(pkg.parts.begin(), pkg.parts.end());
-
-		size_t pieces = pkg.parts.size();
-		auto title_id = root.first.c_str();
-
-		printf("[work] beginning to merge %d %s for package %s...\n", pieces, pieces == 1 ? "piece" : "pieces", title_id);
-
-		string merged_file_name = root.first + "-merged.pkg";
-		string full_merged_file = pkg.file.parent_path().string() + "\\" + merged_file_name;
-
-		if (fs::exists(full_merged_file)) {
-			fs::remove(full_merged_file);
-		}
-
-		printf("\t[work] copying root package file to new file...");
-		auto merged_file = fs::path(full_merged_file);
-
-		// Deal with root file first
-		fs::copy_file(pkg.file, merged_file, fs::copy_options::update_existing);
-		printf("done\n");
-
-		// Using C API from here on because it just works and is fast
-		FILE *merged = fopen(full_merged_file.c_str(), "a+b");
-
-		// Now all the pieces...
-		for (auto & part : pkg.parts) {
-			FILE *to_merge = fopen(part.file.string().c_str(), "r+b");
-
-			auto total_size = fs::file_size(part.file);
-			assert(total_size != 0);
-			char buffer[1024 * 512];
-			uintmax_t copied = 0;
-
-			size_t read_data;
-			while ((read_data = fread(buffer, sizeof(char), sizeof(buffer), to_merge)) > 0)
-			{
-				fwrite(buffer, sizeof(char), read_data, merged);
-				copied += read_data * sizeof(char);
-				auto percentage = ((double)copied / (double)total_size) * 100;
-				printf("\r\t[work] merged %llu/%llu bytes (%.0lf%%) for part %d...", copied, total_size, percentage, part.part);
-			}
-			fclose(to_merge);
-
-			printf("done\n");
-		}
-		fclose(merged);
-	}
-}
-
-int main(int argc, char *argv[])
+bool hasPkgMagic(const fs::path& file)
 {
+    std::ifstream input(file, std::ios::binary);
+
+    if (!input)
+    {
+        return false;
+    }
+
+    std::array<unsigned char, 4> magic{};
+
+    input.read(
+        reinterpret_cast<char*>(magic.data()),
+        static_cast<std::streamsize>(magic.size())
+    );
+
+    return input.gcount() == static_cast<std::streamsize>(magic.size()) &&
+        magic == PKG_MAGIC;
+}
+
+bool appendFile(
+    const fs::path& source,
+    std::ofstream& destination,
+    int partNumber)
+{
+    std::ifstream input(source, std::ios::binary);
+
+    if (!input)
+    {
+        std::cerr
+            << "[error] could not open part file: "
+            << source.string()
+            << '\n';
+
+        return false;
+    }
+
+    std::error_code error;
+    const std::uintmax_t totalSize = fs::file_size(source, error);
+
+    if (error)
+    {
+        std::cerr
+            << "[error] could not determine file size for: "
+            << source.string()
+            << '\n';
+
+        return false;
+    }
+
+    constexpr std::size_t BUFFER_SIZE = 512 * 1024;
+    vector<char> buffer(BUFFER_SIZE);
+
+    std::uintmax_t copied = 0;
+
+    while (input)
+    {
+        input.read(
+            buffer.data(),
+            static_cast<std::streamsize>(buffer.size())
+        );
+
+        const std::streamsize bytesRead = input.gcount();
+
+        if (bytesRead <= 0)
+        {
+            break;
+        }
+
+        destination.write(buffer.data(), bytesRead);
+
+        if (!destination)
+        {
+            std::cerr
+                << "\n[error] failed writing part "
+                << partNumber
+                << '\n';
+
+            return false;
+        }
+
+        copied += static_cast<std::uintmax_t>(bytesRead);
+
+        const double percentage =
+            totalSize == 0
+            ? 100.0
+            : static_cast<double>(copied) /
+            static_cast<double>(totalSize) * 100.0;
+
+        std::cout
+            << "\r\t[work] merged "
+            << copied
+            << "/"
+            << totalSize
+            << " bytes ("
+            << static_cast<int>(percentage)
+            << "%) for part "
+            << partNumber
+            << "..."
+            << std::flush;
+    }
+
+    std::cout << "done\n";
+    return true;
+}
+
+void mergePackages(map<string, Package>& packages)
+{
+    for (auto& root : packages)
+    {
+        Package& package = root.second;
+
+        std::sort(package.parts.begin(), package.parts.end());
+
+        const std::size_t pieceCount = package.parts.size();
+
+        std::cout
+            << "[work] beginning to merge "
+            << pieceCount
+            << (pieceCount == 1 ? " piece" : " pieces")
+            << " for package "
+            << root.first
+            << "...\n";
+
+        const fs::path mergedFile =
+            package.file.parent_path() /
+            (root.first + "-merged.pkg");
+
+        std::error_code error;
+
+        if (fs::exists(mergedFile, error))
+        {
+            fs::remove(mergedFile, error);
+
+            if (error)
+            {
+                std::cerr
+                    << "[error] could not remove existing output file: "
+                    << mergedFile.string()
+                    << '\n';
+
+                continue;
+            }
+        }
+
+        std::cout
+            << "\t[work] copying root package file to new file..."
+            << std::flush;
+
+        fs::copy_file(
+            package.file,
+            mergedFile,
+            fs::copy_options::overwrite_existing,
+            error
+        );
+
+        if (error)
+        {
+            std::cerr
+                << "\n[error] failed to copy root package: "
+                << error.message()
+                << '\n';
+
+            continue;
+        }
+
+        std::cout << "done\n";
+
+        std::ofstream output(
+            mergedFile,
+            std::ios::binary | std::ios::app
+        );
+
+        if (!output)
+        {
+            std::cerr
+                << "[error] could not open merged file: "
+                << mergedFile.string()
+                << '\n';
+
+            continue;
+        }
+
+        bool success = true;
+
+        for (const Package& part : package.parts)
+        {
+            if (!appendFile(part.file, output, part.part))
+            {
+                success = false;
+                break;
+            }
+        }
+
+        output.close();
+
+        if (success)
+        {
+            std::cout
+                << "[success] created "
+                << mergedFile.string()
+                << '\n';
+        }
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    fs::path directory;
+
 #ifndef _DEBUG
-	if (argc != 2) {
-		std::cout << "No pkg directory supplied\nUsage: pkg-merge.exe <directory>" << std::endl;
-		return 1;
-}
-	string dir = argv[1];
+    if (argc != 2)
+    {
+        std::cout
+            << "No PKG directory supplied.\n"
+            << "Usage: pkg-merge.exe <directory>\n";
+
+        return 1;
+    }
+
+    directory = argv[1];
 #else
-	string dir = "E:\\Code\\Go\\src\\github.com\\Tustin\\pkg-merge\\Debug\\pkgs";
-#endif // !_DEBUG
+    directory =
+        R"(E:\Code\Go\src\github.com\Tustin\pkg-merge\Debug\pkgs)";
+#endif
 
+    std::error_code error;
 
-	if (!fs::is_directory(dir)) {
-		printf("[error] argument '%s' is not a directory\n", dir.c_str());
-		return 1;
-	}
-	map<string, Package> packages;
-	for (auto & file : fs::directory_iterator(dir)) {
-		string file_name = file.path().filename().string();
+    if (!fs::is_directory(directory, error))
+    {
+        std::cerr
+            << "[error] argument '"
+            << directory.string()
+            << "' is not a directory\n";
 
-		if (file.path().extension() != ".pkg") {
-			printf("[warn] '%s' is not a PKG file. skipping...\n", file_name);
-			continue;
-		}
+        return 1;
+    }
 
-		if (file_name.find("-merged") != string::npos) continue;
+    map<string, Package> packages;
+    vector<Package> packageParts;
 
-		size_t found_part_begin = file_name.find_last_of("_") + 1;
-		size_t found_part_end = file_name.find_first_of(".");
-		string part = file_name.substr(found_part_begin, found_part_end - found_part_begin);
-		string title_id = file_name.substr(0, found_part_begin - 1);
-		char* ptr = NULL;
-		auto pkg_piece = strtol(part.c_str(), &ptr, 10);
-		if (ptr == NULL) {
-			printf("[warn] '%s' is not a valid piece (fails integer conversion). skipping...\n", part.c_str());
-			continue;
-		}
+    for (const fs::directory_entry& entry :
+        fs::directory_iterator(directory))
+    {
+        if (!entry.is_regular_file())
+        {
+            continue;
+        }
 
-		//Check if package exists
-		auto it = packages.find(title_id);
-		if (it != packages.end()) {
-			//Exists, so add this as a piece
-			auto pkg = &it->second;
-			auto piece = Package();
-			piece.file = file.path();
-			piece.part = pkg_piece;
-			pkg->parts.push_back(piece);
-			printf("[success] found piece %d for PKG file %s\n", pkg_piece, title_id.c_str());
-			continue;
-		}
+        const fs::path& path = entry.path();
+        const string fileName = path.filename().string();
 
-		//Wasn't found, so let's try to see if it's a root PKG file.
-		std::ifstream ifs(file.path(), std::ios::binary);
-		char magic[4];
-		ifs.read(magic, sizeof(magic));
-		ifs.close();
+        if (path.extension() != ".pkg")
+        {
+            std::cout
+                << "[warn] '"
+                << fileName
+                << "' is not a PKG file. Skipping...\n";
 
-		if (memcmp(magic, PKG_MAGIC, sizeof(PKG_MAGIC) != 0)) {
-			printf("[warn] assumed root PKG file '%s' doesn't match PKG magic (is %x, wants %x). skipping...\n", file_name.c_str(), magic, PKG_MAGIC);
-			continue;
-		}
+            continue;
+        }
 
-		auto package = Package();
-		package.part = 0;
-		package.file = file.path();
-		packages.insert(std::pair<string, Package>(title_id, package));
-		printf("[success] found root PKG file for %s\n", title_id.c_str());
+        if (fileName.find("-merged") != string::npos)
+        {
+            continue;
+        }
 
-	}
-	merge(packages);
-	printf("\n[success] completed\n");
-	return 0;
+        const std::size_t underscorePosition =
+            fileName.find_last_of('_');
+
+        const std::size_t extensionPosition =
+            fileName.find_last_of('.');
+
+        if (underscorePosition == string::npos ||
+            extensionPosition == string::npos ||
+            underscorePosition >= extensionPosition)
+        {
+            std::cout
+                << "[warn] '"
+                << fileName
+                << "' does not have the expected name format. "
+                << "Skipping...\n";
+
+            continue;
+        }
+
+        const string titleId =
+            fileName.substr(0, underscorePosition);
+
+        const string partText =
+            fileName.substr(
+                underscorePosition + 1,
+                extensionPosition - underscorePosition - 1
+            );
+
+        char* end = nullptr;
+        const long parsedPart =
+            std::strtol(partText.c_str(), &end, 10);
+
+        if (end == partText.c_str() || *end != '\0')
+        {
+            std::cout
+                << "[warn] '"
+                << partText
+                << "' is not a valid part number. Skipping...\n";
+
+            continue;
+        }
+
+        Package package;
+        package.part = static_cast<int>(parsedPart);
+        package.file = path;
+
+        if (hasPkgMagic(path))
+        {
+            package.part = 0;
+
+            packages[titleId] = package;
+
+            std::cout
+                << "[success] found root PKG file for "
+                << titleId
+                << '\n';
+        }
+        else
+        {
+            packageParts.push_back(package);
+
+            std::cout
+                << "[success] found piece "
+                << package.part
+                << " for PKG file "
+                << titleId
+                << '\n';
+        }
+    }
+
+    // Attach each part to its corresponding root package.
+    for (const Package& part : packageParts)
+    {
+        const string fileName = part.file.filename().string();
+        const std::size_t underscorePosition =
+            fileName.find_last_of('_');
+
+        const string titleId =
+            fileName.substr(0, underscorePosition);
+
+        const auto package = packages.find(titleId);
+
+        if (package == packages.end())
+        {
+            std::cout
+                << "[warn] no root PKG was found for part file '"
+                << fileName
+                << "'. Skipping...\n";
+
+            continue;
+        }
+
+        package->second.parts.push_back(part);
+    }
+
+    if (packages.empty())
+    {
+        std::cerr << "[error] no root PKG files were found\n";
+        return 1;
+    }
+
+    mergePackages(packages);
+
+    std::cout << "\n[success] completed\n";
+    return 0;
 }
-
-
-
-
